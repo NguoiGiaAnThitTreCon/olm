@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         OLM Answer Viewer - Deep Space Edition
+// @name         OLM Ultimate Viewer - Fix Missing Answers
 // @namespace    http://tampermonkey.net/
-// @version      4.0
-// @description  Xem đáp án OLM tự động (Fix MathJax & UI Upgrade)
+// @version      5.1
+// @description  Xem đáp án OLM (Fix lỗi không hiện đáp án + UI Glassmorphism)
 // @author       NguyenTrongg
 // @match        https://olm.vn/*
 // @match        https://*.olm.vn/*
@@ -15,498 +15,459 @@
 (function() {
     'use strict';
 
-    // ============ UTILITY FUNCTIONS ============
-    const decodeBase64Utf8 = (base64) => {
-        try {
-            const binaryString = atob(base64);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-                bytes[i] = binaryString.charCodeAt(i);
+    // ==========================================
+    // 1. CORE UTILITIES (LOGIC TÌM ĐÁP ÁN MẠNH MẼ HƠN)
+    // ==========================================
+    const Utils = {
+        decodeBase64: (str) => {
+            try {
+                return new TextDecoder('utf-8').decode(
+                    Uint8Array.from(atob(str), c => c.charCodeAt(0))
+                );
+            } catch (e) { return null; }
+        },
+
+        cleanHTML: (html, fallbackTitle) => {
+            const div = document.createElement('div');
+            div.innerHTML = html;
+            // Xóa các phần tử rác không cần thiết
+            const trash = ['.loigiai', '.solution', '.answer-section', 'script', 'style', '.interaction', '.explanation'];
+            trash.forEach(s => div.querySelectorAll(s).forEach(e => e.remove()));
+
+            let content = div.innerHTML.trim();
+            // Nếu nội dung quá ngắn hoặc rỗng, dùng title
+            return (content.length > 5) ? content : (fallbackTitle || 'Câu hỏi hình ảnh/âm thanh');
+        },
+
+        // --- HÀM TÌM ĐÁP ÁN ĐƯỢC NÂNG CẤP ---
+        getAnswers: (html, json) => {
+            let results = new Set(); // Dùng Set để tự động loại bỏ trùng lặp
+
+            // 1. QUÉT JSON (Độ chính xác 100%)
+            if (json) {
+                try {
+                    const data = JSON.parse(json);
+
+                    // Hàm đệ quy tìm tất cả node có thuộc tính correct = true
+                    const deepScan = (obj) => {
+                        if (!obj || typeof obj !== 'object') return;
+
+                        // Nếu tìm thấy dấu hiệu đúng
+                        if (obj.correct === true || obj.is_correct === true || obj.score > 0) {
+                            if (obj.text) results.add(Utils.stripTags(obj.text));
+                            if (obj.content) results.add(Utils.stripTags(obj.content));
+                        }
+
+                        // Duyệt qua các con (children, options, pairs...)
+                        Object.keys(obj).forEach(key => {
+                            if (typeof obj[key] === 'object') deepScan(obj[key]);
+                        });
+                    };
+                    deepScan(data);
+                } catch(e){}
             }
-            return new TextDecoder('utf-8').decode(bytes);
-        } catch (e) {
-            return null; // Silent fail
-        }
-    };
 
-    const extractAnswerFromJSON = (jsonContent) => {
-        try {
-            const jsonData = JSON.parse(jsonContent);
-            const answers = [];
-            const findAllCorrect = (node) => {
-                if (!node) return;
-                if (node.correct === true) {
-                    const text = extractText(node);
-                    if (text) answers.push(text);
-                }
-                if (node.children) node.children.forEach(child => findAllCorrect(child));
-            };
-            const extractText = (node) => {
-                if (!node) return '';
-                let text = node.text || '';
-                if (node.children) text += node.children.map(extractText).join('');
-                return text.trim();
-            };
-            findAllCorrect(jsonData.root);
-            return answers.length > 0 ? answers : null;
-        } catch (e) {
-            return null;
-        }
-    };
+            // 2. QUÉT HTML (Fallback nếu JSON không có hoặc thiếu)
+            const div = document.createElement('div');
+            div.innerHTML = html;
 
-    const extractAnswerFromHTML = (html) => {
-        const tempDiv = document.createElement('div');
-        tempDiv.innerHTML = html;
-        const answers = [];
-        const selectors = [
-            '.correctAnswer', '.correct-answer', '[data-correct="true"]',
-            '.answer.correct', 'input[type="radio"][checked]', 'input[type="checkbox"][checked]',
-            '.selected.correct', 'li.correct', 'div.correct', 'span.correct'
-        ];
+            // Danh sách các class/selector OLM thường dùng cho đáp án đúng
+            const selectors = [
+                '.correctAnswer',
+                '[data-correct="true"]',
+                '.correct',
+                '.answer-correct',
+                '.option.correct',
+                '.item-choice.correct',
+                'input[checked]',
+                'input[type="radio"][value="true"]',
+                '.true-answer'
+            ];
 
-        selectors.forEach(selector => {
-            tempDiv.querySelectorAll(selector).forEach(el => {
-                const text = el.textContent.trim();
-                if (text && !answers.includes(text)) answers.push(text);
-            });
-        });
+            selectors.forEach(sel => {
+                div.querySelectorAll(sel).forEach(el => {
+                    // Lấy text của chính nó hoặc label đi kèm
+                    let txt = el.textContent.trim();
 
-        tempDiv.querySelectorAll('input[data-accept]').forEach(input => {
-            input.getAttribute('data-accept').split('|').forEach(val => {
-                const text = val.trim();
-                if (text && !answers.includes(text)) answers.push(text);
-            });
-        });
-
-        tempDiv.querySelectorAll('[data-answer], [answer]').forEach(el => {
-            const answer = el.getAttribute('data-answer') || el.getAttribute('answer');
-            if (answer && !answers.includes(answer.trim())) answers.push(answer.trim());
-        });
-
-        return answers.length > 0 ? answers : null;
-    };
-
-    const extractSolution = (html) => {
-        const tempDiv = document.createElement('div');
-        tempDiv.innerHTML = html;
-        const selectors = ['.loigiai', '.huong-dan-giai', '.explain', '.explanation', '.solution', '#solution', '.guide', '.giai-chi-tiet'];
-
-        for (const selector of selectors) {
-            const element = tempDiv.querySelector(selector);
-            if (element) {
-                // Xóa tiêu đề thừa (Lời giải: ...)
-                element.querySelectorAll('h1, h2, h3, h4, h5, h6, strong, b').forEach(h => {
-                    if (h.textContent.trim().match(/^(lời giải|hướng dẫn|giải|solution|explain)/i)) {
-                        h.remove();
+                    // Nếu là input radio/checkbox, tìm label label liên quan
+                    if (el.tagName === 'INPUT') {
+                        const id = el.id;
+                        if (id) {
+                            const label = div.querySelector(`label[for="${id}"]`);
+                            if (label) txt = label.textContent.trim();
+                        } else if (el.parentElement) {
+                            txt = el.parentElement.textContent.trim();
+                        }
                     }
+
+                    if(txt) results.add(txt);
                 });
-                const content = element.innerHTML.trim();
-                if (content) return content; // Return innerHTML string
+            });
+
+            // 3. XỬ LÝ DẠNG ĐIỀN TỪ (Fill in blank)
+            div.querySelectorAll('input[data-accept]').forEach(i => {
+                const accepts = i.dataset.accept.split('|');
+                accepts.forEach(val => results.add(val.trim()));
+            });
+
+            // 4. REGEX SCAN (Biện pháp cuối cùng - Quét text thô)
+            // Tìm các đoạn text nằm cạnh attribute correct="true" trong chuỗi HTML
+            if (results.size === 0) {
+                const regex = /<[^>]*correct="true"[^>]*>([^<]+)</g;
+                let match;
+                while ((match = regex.exec(html)) !== null) {
+                    if (match[1]) results.add(match[1].trim());
+                }
             }
+
+            return Array.from(results);
+        },
+
+        stripTags: (html) => {
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            return doc.body.textContent || "";
+        },
+
+        getSolution: (html) => {
+            const div = document.createElement('div');
+            div.innerHTML = html;
+            // Tìm các class chứa lời giải
+            const sol = div.querySelector('.loigiai, .solution, .huong-dan-giai, .explanation, .exp, .giai-chi-tiet');
+            if (!sol) return null;
+
+            // Xóa tiêu đề thừa
+            sol.querySelectorAll('strong, h2, h3, h4, .title').forEach(el => {
+                const txt = el.textContent.toLowerCase();
+                if(txt.includes('lời giải') || txt.includes('hướng dẫn') || txt.includes('giải thích')) el.remove();
+            });
+            return sol.innerHTML.trim();
         }
-        return null;
     };
 
-    const extractCleanQuestion = (html, title) => {
-        const tempDiv = document.createElement('div');
-        tempDiv.innerHTML = html;
-        const removeSelectors = [
-            'ol.quiz-list', 'ul.quiz-list', '.interaction', '.form-group',
-            '.loigiai', '.huong-dan-giai', '.explain', '.solution',
-            '.answer-section', '.correctAnswer', 'script', 'style'
-        ];
-        removeSelectors.forEach(s => tempDiv.querySelectorAll(s).forEach(el => el.remove()));
-        let content = tempDiv.innerHTML.trim();
-        return (!content || content.length < 5) ? (title || 'Câu hỏi') : content;
-    };
-
-    // ============ UI CLASS ============
-    class AnswerViewerUI {
+    // ==========================================
+    // 2. UI CLASS (GIAO DIỆN GLASSMORPHISM)
+    // ==========================================
+    class ViewerUI {
         constructor() {
-            this.answers = [];
-            this.isVisible = true;
-            this.isMinimized = false;
-            this.searchTerm = '';
-            this.position = { x: 20, y: 80 };
-            this.isDragging = false;
-            this.dragOffset = { x: 0, y: 0 };
+            this.state = {
+                data: [],
+                visible: true,
+                minimized: false,
+                search: '',
+                pos: { x: 20, y: 20 }
+            };
             this.init();
         }
 
         init() {
-            this.injectStyles();
-            this.createUI();
-            this.attachEvents();
+            this.addStyles();
+            this.renderContainer();
+            this.bindEvents();
         }
 
-        injectStyles() {
-            const styles = `
-                @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        addStyles() {
+            const css = `
+                @import url('https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&display=swap');
 
-                @keyframes slideIn { from { transform: translateX(-20px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
-                @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(124, 58, 237, 0.4); } 70% { box-shadow: 0 0 0 10px rgba(124, 58, 237, 0); } 100% { box-shadow: 0 0 0 0 rgba(124, 58, 237, 0); } }
-                @keyframes stars { from { background-position: 0 0; } to { background-position: 1000px 1000px; } }
+                :root {
+                    --olm-bg: rgba(15, 23, 42, 0.9);
+                    --olm-border: rgba(255, 255, 255, 0.15);
+                    --olm-accent: #8b5cf6;
+                    --olm-success: #10b981;
+                    --olm-text: #f1f5f9;
+                }
 
-                .olm-viewer-container {
-                    position: fixed !important;
-                    width: 450px;
-                    max-height: 85vh;
-                    background: rgba(10, 10, 15, 0.95);
-                    backdrop-filter: blur(12px);
-                    -webkit-backdrop-filter: blur(12px);
-                    border: 1px solid rgba(255, 255, 255, 0.1);
+                .uv-container {
+                    position: fixed; width: 450px; max-height: 85vh;
+                    background: var(--olm-bg);
+                    backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+                    border: 1px solid var(--olm-border);
                     border-radius: 16px;
-                    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
-                    z-index: 999999 !important;
-                    display: flex;
-                    flex-direction: column;
-                    font-family: 'Inter', system-ui, sans-serif;
-                    animation: slideIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-                    color: #e2e8f0;
-                    overflow: hidden;
-                    transition: height 0.3s ease, opacity 0.3s ease;
+                    box-shadow: 0 20px 50px rgba(0,0,0,0.6);
+                    color: var(--olm-text);
+                    font-family: 'Be Vietnam Pro', sans-serif;
+                    z-index: 999999;
+                    display: flex; flex-direction: column;
+                    transition: all 0.3s ease;
                 }
 
-                /* Background Stars Effect */
-                .olm-viewer-container::before {
-                    content: "";
-                    position: absolute;
-                    top: 0; left: 0; right: 0; bottom: 0;
-                    background-image:
-                        radial-gradient(white, rgba(255,255,255,.2) 2px, transparent 3px),
-                        radial-gradient(white, rgba(255,255,255,.15) 1px, transparent 2px),
-                        radial-gradient(white, rgba(255,255,255,.1) 2px, transparent 3px);
-                    background-size: 550px 550px, 350px 350px, 250px 250px;
-                    background-position: 0 0, 40px 60px, 130px 270px;
-                    opacity: 0.3;
-                    pointer-events: none;
-                    z-index: 0;
-                }
+                .uv-container.minimized { height: 60px !important; overflow: hidden; }
+                .uv-container.hidden { opacity: 0; pointer-events: none; transform: translateY(20px) scale(0.95); }
 
-                .olm-viewer-container.minimized { max-height: 60px; overflow: hidden; }
-                .olm-viewer-container.hidden { opacity: 0; pointer-events: none; transform: scale(0.95); }
-
-                .olm-header {
+                /* HEADER */
+                .uv-header {
                     padding: 16px;
-                    background: rgba(255, 255, 255, 0.03);
-                    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-                    cursor: grab;
-                    display: flex;
-                    align-items: center;
-                    justify-content: space-between;
-                    position: relative;
-                    z-index: 2;
+                    background: linear-gradient(to right, rgba(255,255,255,0.05), transparent);
+                    border-bottom: 1px solid var(--olm-border);
+                    display: flex; justify-content: space-between; align-items: center;
+                    cursor: grab; user-select: none;
                 }
-                .olm-header:active { cursor: grabbing; }
+                .uv-header:active { cursor: grabbing; }
 
-                .olm-title-group { display: flex; align-items: center; gap: 10px; }
-                .olm-status-dot { width: 8px; height: 8px; background: #10b981; border-radius: 50%; box-shadow: 0 0 8px #10b981; }
-                .olm-title { font-weight: 700; font-size: 15px; background: linear-gradient(90deg, #fff, #a5b4fc); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-                .olm-badge { background: #4f46e5; color: white; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 700; box-shadow: 0 0 10px rgba(79, 70, 229, 0.4); }
+                .uv-brand { font-weight: 700; font-size: 15px; display: flex; align-items: center; gap: 10px; }
+                .uv-pulse { width: 8px; height: 8px; background: var(--olm-success); border-radius: 50%; box-shadow: 0 0 12px var(--olm-success); animation: pulse 2s infinite; }
+                @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
 
-                .olm-controls { display: flex; gap: 8px; }
-                .olm-btn-icon {
-                    background: rgba(255, 255, 255, 0.05);
-                    border: 1px solid rgba(255, 255, 255, 0.1);
-                    color: #94a3b8;
-                    width: 28px; height: 28px;
-                    border-radius: 6px;
-                    cursor: pointer;
+                .uv-badge { background: var(--olm-accent); padding: 2px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+
+                .uv-ctrls { display: flex; gap: 8px; }
+                .uv-btn {
+                    width: 30px; height: 30px; border-radius: 8px; border: none;
+                    background: rgba(255,255,255,0.08); color: #cbd5e1;
+                    cursor: pointer; transition: 0.2s; display: flex; align-items: center; justify-content: center; font-size: 16px;
+                }
+                .uv-btn:hover { background: rgba(255,255,255,0.2); color: #fff; transform: scale(1.05); }
+                .uv-btn.close:hover { background: #ef4444; }
+
+                /* TOOLBAR */
+                .uv-toolbar { padding: 12px; display: flex; gap: 10px; border-bottom: 1px solid var(--olm-border); }
+                .uv-search {
+                    flex: 1; background: rgba(0,0,0,0.4); border: 1px solid var(--olm-border);
+                    padding: 10px 14px; border-radius: 10px; color: #fff; outline: none; font-size: 13px;
+                    transition: border 0.2s;
+                }
+                .uv-search:focus { border-color: var(--olm-accent); }
+
+                /* CONTENT */
+                .uv-content { flex: 1; overflow-y: auto; padding: 14px; scroll-behavior: smooth; }
+                .uv-content::-webkit-scrollbar { width: 6px; }
+                .uv-content::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 10px; }
+                .uv-content::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+
+                .uv-card {
+                    background: rgba(255,255,255,0.02); border: 1px solid var(--olm-border);
+                    border-radius: 12px; padding: 16px; margin-bottom: 14px;
+                    transition: all 0.2s; position: relative; overflow: hidden;
+                }
+                .uv-card:hover { transform: translateY(-2px); border-color: rgba(139, 92, 246, 0.5); background: rgba(255,255,255,0.04); }
+
+                .uv-q-head { display: flex; gap: 12px; margin-bottom: 12px; }
+                .uv-idx {
+                    background: linear-gradient(135deg, var(--olm-accent), #6366f1);
+                    width: 28px; height: 28px; flex-shrink: 0;
                     display: flex; align-items: center; justify-content: center;
-                    font-size: 14px;
-                    transition: all 0.2s;
+                    border-radius: 8px; font-weight: 700; font-size: 13px; box-shadow: 0 4px 10px rgba(139, 92, 246, 0.3);
                 }
-                .olm-btn-icon:hover { background: rgba(255, 255, 255, 0.1); color: white; border-color: rgba(255,255,255,0.2); }
-                .olm-btn-close:hover { background: #ef4444; border-color: #ef4444; }
+                .uv-q-txt { font-size: 14px; line-height: 1.6; color: #e2e8f0; word-wrap: break-word; }
+                .uv-q-txt img { max-width: 100%; border-radius: 6px; margin-top: 8px; border: 1px solid var(--olm-border); }
 
-                .olm-toolbar {
-                    padding: 12px;
-                    background: rgba(0, 0, 0, 0.2);
-                    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-                    display: flex; gap: 8px; position: relative; z-index: 2;
-                }
+                .uv-box { padding: 12px; border-radius: 10px; margin-top: 10px; font-size: 14px; }
+                .uv-ans { background: rgba(16, 185, 129, 0.1); border-left: 4px solid var(--olm-success); }
+                .uv-sol { background: rgba(59, 130, 246, 0.1); border-left: 4px solid #3b82f6; }
 
-                .olm-search-wrapper { position: relative; flex: 1; }
-                .olm-search-icon { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: #64748b; font-size: 12px; }
-                .olm-search {
-                    width: 100%;
-                    padding: 8px 10px 8px 30px;
-                    background: rgba(0, 0, 0, 0.3);
-                    border: 1px solid rgba(255, 255, 255, 0.1);
-                    border-radius: 8px;
-                    color: white; font-size: 13px; outline: none; box-sizing: border-box;
-                    transition: border-color 0.2s;
-                }
-                .olm-search:focus { border-color: #6366f1; }
+                .uv-label { font-size: 11px; font-weight: 800; text-transform: uppercase; margin-bottom: 6px; opacity: 0.9; letter-spacing: 0.5px; }
+                .uv-ans .uv-label { color: var(--olm-success); }
+                .uv-sol .uv-label { color: #60a5fa; }
 
-                .olm-content {
-                    flex: 1;
-                    overflow-y: auto;
-                    padding: 12px;
-                    position: relative; z-index: 2;
-                }
-                .olm-content::-webkit-scrollbar { width: 6px; }
-                .olm-content::-webkit-scrollbar-track { background: transparent; }
-                .olm-content::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.15); border-radius: 3px; }
-                .olm-content::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.25); }
+                .uv-list { margin: 0; padding-left: 18px; color: #f8fafc; font-weight: 500; }
+                .uv-list li { margin-bottom: 4px; }
 
-                .olm-card {
-                    background: rgba(30, 41, 59, 0.4);
-                    border: 1px solid rgba(255, 255, 255, 0.05);
-                    border-radius: 12px;
-                    padding: 16px;
-                    margin-bottom: 12px;
-                    transition: transform 0.2s, border-color 0.2s;
-                }
-                .olm-card:hover { border-color: rgba(99, 102, 241, 0.3); transform: translateY(-1px); }
-
-                .olm-q-header { display: flex; gap: 12px; margin-bottom: 12px; }
-                .olm-q-num {
-                    flex-shrink: 0; width: 24px; height: 24px;
-                    background: linear-gradient(135deg, #6366f1, #8b5cf6);
-                    color: white; font-weight: 700; font-size: 12px;
-                    border-radius: 6px; display: flex; align-items: center; justify-content: center;
-                }
-                .olm-q-text { font-size: 13px; line-height: 1.5; color: #f1f5f9; }
-                .olm-q-text img { max-width: 100%; border-radius: 4px; }
-
-                .olm-section {
-                    margin-left: 36px; padding: 10px; border-radius: 8px; margin-bottom: 8px; position: relative;
-                }
-                .olm-ans-box { background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.2); }
-                .olm-sol-box { background: rgba(59, 130, 246, 0.1); border: 1px solid rgba(59, 130, 246, 0.2); }
-
-                .olm-label { font-size: 10px; font-weight: 700; text-transform: uppercase; margin-bottom: 4px; letter-spacing: 0.5px; }
-                .olm-ans-label { color: #34d399; }
-                .olm-sol-label { color: #60a5fa; }
-
-                .olm-text-content { font-size: 13px; color: #e2e8f0; line-height: 1.5; }
-                .olm-text-content p { margin: 0; }
-
-                .olm-footer {
-                    padding: 10px; text-align: center; font-size: 10px; color: #64748b;
-                    border-top: 1px solid rgba(255, 255, 255, 0.05); background: rgba(0,0,0,0.2);
-                }
-
-                .olm-float-btn {
+                /* FLOATING BTN */
+                .uv-float {
                     position: fixed; bottom: 30px; right: 30px;
-                    width: 50px; height: 50px;
-                    background: linear-gradient(135deg, #4f46e5, #ec4899);
-                    border-radius: 50%;
+                    width: 56px; height: 56px; border-radius: 50%;
+                    background: linear-gradient(135deg, #8b5cf6, #ec4899);
+                    box-shadow: 0 4px 25px rgba(139, 92, 246, 0.6);
+                    border: 2px solid rgba(255,255,255,0.2);
+                    color: #fff; font-size: 26px; cursor: pointer;
+                    z-index: 999998; transition: 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
                     display: flex; align-items: center; justify-content: center;
-                    font-size: 24px; color: white; cursor: pointer;
-                    box-shadow: 0 4px 15px rgba(79, 70, 229, 0.5);
-                    z-index: 999998; border: none;
-                    transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
-                    animation: pulse 3s infinite;
                 }
-                .olm-float-btn:hover { transform: scale(1.1) rotate(15deg); }
-                .olm-float-btn.hidden { display: none; }
+                .uv-float:hover { transform: scale(1.15) rotate(15deg); box-shadow: 0 6px 35px rgba(139, 92, 246, 0.8); }
+                .uv-float.hide { display: none; }
 
-                /* MathJax overrides */
-                .mjx-chtml { font-size: 110% !important; }
+                /* MATHJAX OVERRIDE */
+                mjx-container { font-size: 115% !important; color: #fff !important; }
             `;
-            const styleSheet = document.createElement("style");
-            styleSheet.textContent = styles;
-            document.head.appendChild(styleSheet);
+            const style = document.createElement('style');
+            style.textContent = css;
+            document.head.appendChild(style);
         }
 
-        createUI() {
-            this.container = document.createElement('div');
-            this.container.className = 'olm-viewer-container';
-            this.container.style.left = this.position.x + 'px';
-            this.container.style.top = this.position.y + 'px';
+        renderContainer() {
+            this.root = document.createElement('div');
+            this.root.className = 'uv-container';
+            this.root.style.left = this.state.pos.x + 'px';
+            this.root.style.top = this.state.pos.y + 'px';
 
-            this.container.innerHTML = `
-                <div class="olm-header">
-                    <div class="olm-title-group">
-                        <div class="olm-status-dot"></div>
-                        <div class="olm-title">OLM SPACE</div>
-                        <div class="olm-badge">0</div>
+            this.root.innerHTML = `
+                <div class="uv-header">
+                    <div class="uv-brand">
+                        <div class="uv-pulse"></div>
+                        <span>OLM ULTIMATE</span>
+                        <span class="uv-badge">0</span>
                     </div>
-                    <div class="olm-controls">
-                        <button class="olm-btn-icon olm-minimize" title="Thu gọn">_</button>
-                        <button class="olm-btn-icon olm-btn-close olm-hide" title="Ẩn">×</button>
-                    </div>
-                </div>
-                <div class="olm-toolbar">
-                    <div class="olm-search-wrapper">
-                        <span class="olm-search-icon">🔍</span>
-                        <input type="text" class="olm-search" placeholder="Tìm kiếm câu hỏi...">
-                    </div>
-                    <button class="olm-btn-icon olm-clear" title="Xóa dữ liệu">🗑️</button>
-                </div>
-                <div class="olm-content">
-                    <div style="text-align: center; padding: 40px 20px; color: #64748b;">
-                        <div style="font-size: 40px; margin-bottom: 10px;">🪐</div>
-                        <div>Đang quét dữ liệu từ vũ trụ OLM...</div>
-                        <div style="font-size: 11px; margin-top: 5px;">Hãy làm bài để hiện đáp án</div>
+                    <div class="uv-ctrls">
+                        <button class="uv-btn min" title="Thu gọn">─</button>
+                        <button class="uv-btn close" title="Ẩn">✕</button>
                     </div>
                 </div>
-                <div class="olm-footer">Deep Space Edition v4.0 • NguyenTrongg</div>
+                <div class="uv-toolbar">
+                    <input type="text" class="uv-search" placeholder="Tìm kiếm câu hỏi (beta)...">
+                    <button class="uv-btn clear" title="Xóa dữ liệu cũ">🗑️</button>
+                </div>
+                <div class="uv-content">
+                    <div style="text-align:center; padding: 60px 20px; opacity: 0.5;">
+                        <div style="font-size: 42px; margin-bottom: 16px; animation: float 3s ease-in-out infinite;">🛸</div>
+                        <div style="font-weight:600; font-size:15px;">Đang quét dữ liệu...</div>
+                        <div style="font-size:12px; margin-top:6px;">Hãy vào bài làm để kích hoạt</div>
+                    </div>
+                </div>
             `;
 
             this.floatBtn = document.createElement('button');
-            this.floatBtn.className = 'olm-float-btn hidden';
-            this.floatBtn.innerHTML = '🚀';
+            this.floatBtn.className = 'uv-float hide';
+            this.floatBtn.innerHTML = '⚡';
 
-            document.body.appendChild(this.container);
+            document.body.appendChild(this.root);
             document.body.appendChild(this.floatBtn);
 
-            // Bind elements
-            this.contentArea = this.container.querySelector('.olm-content');
-            this.badge = this.container.querySelector('.olm-badge');
-            this.searchInput = this.container.querySelector('.olm-search');
+            // Cache DOM
+            this.dom = {
+                content: this.root.querySelector('.uv-content'),
+                badge: this.root.querySelector('.uv-badge'),
+                search: this.root.querySelector('.uv-search')
+            };
         }
 
-        attachEvents() {
-            // Drag Logic (Global)
-            const header = this.container.querySelector('.olm-header');
+        bindEvents() {
+            // Drag Logic
+            const header = this.root.querySelector('.uv-header');
+            let isDragging = false, offset = {x:0, y:0};
 
             header.addEventListener('mousedown', (e) => {
-                if(e.target.closest('button')) return;
-                this.isDragging = true;
-                const rect = this.container.getBoundingClientRect();
-                this.dragOffset = { x: e.clientX - rect.left, y: e.clientY - rect.top };
-                this.container.style.transition = 'none'; // Disable transition when dragging
+                if(e.target.tagName === 'BUTTON') return;
+                isDragging = true;
+                const rect = this.root.getBoundingClientRect();
+                offset = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+                this.root.style.transition = 'none'; // Disable transition when dragging
             });
 
             document.addEventListener('mousemove', (e) => {
-                if (!this.isDragging) return;
+                if(!isDragging) return;
                 e.preventDefault();
-                let x = e.clientX - this.dragOffset.x;
-                let y = e.clientY - this.dragOffset.y;
-
-                // Bounds checking
-                x = Math.max(0, Math.min(window.innerWidth - this.container.offsetWidth, x));
-                y = Math.max(0, Math.min(window.innerHeight - this.container.offsetHeight, y));
-
-                this.container.style.left = x + 'px';
-                this.container.style.top = y + 'px';
+                this.root.style.left = (e.clientX - offset.x) + 'px';
+                this.root.style.top = (e.clientY - offset.y) + 'px';
             });
 
             document.addEventListener('mouseup', () => {
-                if(this.isDragging) {
-                    this.isDragging = false;
-                    this.container.style.transition = 'height 0.3s ease, opacity 0.3s ease';
+                if(isDragging) {
+                    isDragging = false;
+                    this.root.style.transition = 'all 0.3s ease';
                 }
             });
 
-            // Buttons
-            this.container.querySelector('.olm-minimize').addEventListener('click', () => {
-                this.isMinimized = !this.isMinimized;
-                this.container.classList.toggle('minimized', this.isMinimized);
-            });
+            // Actions
+            this.root.querySelector('.min').onclick = () => {
+                this.state.minimized = !this.state.minimized;
+                this.root.classList.toggle('minimized', this.state.minimized);
+                this.root.querySelector('.min').textContent = this.state.minimized ? '◻' : '─';
+            };
 
-            this.container.querySelector('.olm-hide').addEventListener('click', () => this.toggleVisibility());
-            this.floatBtn.addEventListener('click', () => this.toggleVisibility());
+            const toggle = () => {
+                this.state.visible = !this.state.visible;
+                this.root.classList.toggle('hidden', !this.state.visible);
+                this.floatBtn.classList.toggle('hide', this.state.visible);
+            };
+            this.root.querySelector('.close').onclick = toggle;
+            this.floatBtn.onclick = toggle;
 
-            this.container.querySelector('.olm-clear').addEventListener('click', () => {
-                if(confirm('Xóa sạch dữ liệu đã thu thập?')) {
-                    this.answers = [];
-                    this.renderAnswers();
+            this.root.querySelector('.clear').onclick = () => {
+                if(confirm('Bạn muốn xóa danh sách hiện tại?')) {
+                    this.state.data = [];
+                    this.renderList();
                 }
+            };
+
+            this.dom.search.addEventListener('input', (e) => {
+                this.state.search = e.target.value.toLowerCase();
+                this.renderList();
             });
 
-            this.searchInput.addEventListener('input', (e) => {
-                this.searchTerm = e.target.value;
-                this.renderAnswers();
-            });
-
-            // Shortcut
+            // Shortcut Shift Right
             document.addEventListener('keydown', (e) => {
-                if (e.code === 'ShiftRight') this.toggleVisibility();
+                if(e.code === 'ShiftRight') toggle();
             });
         }
 
-        toggleVisibility() {
-            this.isVisible = !this.isVisible;
-            this.container.classList.toggle('hidden', !this.isVisible);
-            this.floatBtn.classList.toggle('hidden', this.isVisible);
-        }
+        addData(rawData) {
+            if (!Array.isArray(rawData)) return;
 
-        addAnswers(data) {
-            if (!Array.isArray(data)) return;
+            let hasNew = false;
+            rawData.forEach((item, idx) => {
+                const decoded = Utils.decodeBase64(item.content || '');
+                if (!decoded) return;
 
-            const processed = data.map((q, i) => {
-                const decoded = decodeBase64Utf8(q.content || '');
-                if (!decoded) return null;
-
-                let answers = null;
-                if (q.json_content) answers = extractAnswerFromJSON(q.json_content);
-                if (!answers) answers = extractAnswerFromHTML(decoded);
-
-                const solution = extractSolution(decoded);
-                // Simple ID check to prevent dupe
-                const id = q.id || (decoded.substring(0, 20) + i);
-
-                return {
-                    id: id,
-                    question: extractCleanQuestion(decoded, q.title),
-                    answers: answers,
-                    solution: solution,
-                    timestamp: new Date().toLocaleTimeString('vi-VN')
+                const qObj = {
+                    id: item.id || (Date.now() + idx),
+                    html: Utils.cleanHTML(decoded, item.title),
+                    answers: Utils.getAnswers(decoded, item.json_content),
+                    solution: Utils.getSolution(decoded)
                 };
-            }).filter(Boolean);
 
-            // Merge and de-duplicate based on content hash/ID
-            processed.forEach(newItem => {
-                if (!this.answers.some(existing => existing.id === newItem.id)) {
-                    this.answers.unshift(newItem);
+                // Push vào cuối để giữ thứ tự 1, 2, 3
+                if (!this.state.data.find(x => x.id === qObj.id)) {
+                    this.state.data.push(qObj);
+                    hasNew = true;
                 }
             });
 
-            this.renderAnswers();
+            if (hasNew) this.renderList();
         }
 
-        renderAnswers() {
-            const filtered = this.answers.filter(item => {
-                if (!this.searchTerm) return true;
-                const div = document.createElement('div');
-                div.innerHTML = item.question;
-                return div.textContent.toLowerCase().includes(this.searchTerm.toLowerCase());
+        renderList() {
+            const { data, search } = this.state;
+            const filtered = data.filter(item => {
+                const temp = document.createElement('div');
+                temp.innerHTML = item.html;
+                return !search || temp.textContent.toLowerCase().includes(search);
             });
 
-            this.badge.textContent = this.answers.length;
+            this.dom.badge.textContent = data.length;
 
             if (filtered.length === 0) {
-                if (this.answers.length > 0) {
-                    this.contentArea.innerHTML = `<div style="text-align:center; padding: 20px; color:#94a3b8;">Không tìm thấy kết quả nào</div>`;
+                if (data.length > 0) {
+                    this.dom.content.innerHTML = `<div style="text-align:center; padding: 20px; opacity:0.6">Không tìm thấy kết quả</div>`;
                 }
                 return;
             }
 
-            this.contentArea.innerHTML = filtered.map((item, index) => {
+            this.dom.content.innerHTML = filtered.map((item, index) => {
                 let ansHTML = '';
-                if (item.answers) {
-                    const content = Array.isArray(item.answers)
-                        ? `<ul style="margin:0; padding-left:15px;">${item.answers.map(a => `<li>${a}</li>`).join('')}</ul>`
-                        : item.answers;
+                if (item.answers.length > 0) {
                     ansHTML = `
-                        <div class="olm-section olm-ans-box">
-                            <div class="olm-label olm-ans-label">✓ Đáp án</div>
-                            <div class="olm-text-content">${content}</div>
+                        <div class="uv-box uv-ans">
+                            <div class="uv-label">✓ ĐÁP ÁN</div>
+                            <ul class="uv-list">
+                                ${item.answers.map(a => `<li>${a}</li>`).join('')}
+                            </ul>
                         </div>`;
                 }
 
                 let solHTML = '';
                 if (item.solution) {
                     solHTML = `
-                        <div class="olm-section olm-sol-box">
-                            <div class="olm-label olm-sol-label">✎ Lời giải chi tiết</div>
-                            <div class="olm-text-content">${item.solution}</div>
+                        <div class="uv-box uv-sol">
+                            <div class="uv-label">✎ LỜI GIẢI CHI TIẾT</div>
+                            <div style="line-height:1.5">${item.solution}</div>
                         </div>`;
                 }
 
+                // Nếu không có cả đáp án và lời giải -> Cảnh báo
+                let emptyHTML = '';
+                if (!ansHTML && !solHTML) {
+                    emptyHTML = `<div class="uv-box" style="background:rgba(255,255,255,0.05); border:1px dashed rgba(255,255,255,0.2); font-style:italic; opacity:0.7">⚠️ Chưa quét được đáp án cho câu này</div>`;
+                }
+
                 return `
-                    <div class="olm-card">
-                        <div class="olm-q-header">
-                            <div class="olm-q-num">${filtered.length - index}</div>
-                            <div class="olm-q-text">${item.question}</div>
+                    <div class="uv-card">
+                        <div class="uv-q-head">
+                            <div class="uv-idx">${index + 1}</div>
+                            <div class="uv-q-txt">${item.html}</div>
                         </div>
                         ${ansHTML}
                         ${solHTML}
-                        ${!ansHTML && !solHTML ? '<div class="olm-section" style="border:1px dashed #475569; color: #64748b; font-size:12px; font-style:italic;">⚠️ Chưa có dữ liệu đáp án</div>' : ''}
+                        ${emptyHTML}
                     </div>
                 `;
             }).join('');
@@ -515,84 +476,58 @@
         }
 
         renderMath() {
-            // Debounce render
-            if (this.mathTimeout) clearTimeout(this.mathTimeout);
-            this.mathTimeout = setTimeout(() => {
+            setTimeout(() => {
                 const w = unsafeWindow || window;
-                const container = this.contentArea;
-
-                // 1. Try MathJax v3 (Promise-based)
-                if (w.MathJax && w.MathJax.typesetPromise) {
-                    w.MathJax.typesetPromise([container]).catch(err => console.log('MathJax v3 err:', err));
+                if (w.MathJax) {
+                    if(w.MathJax.typesetPromise) w.MathJax.typesetPromise([this.dom.content]).catch(()=>{});
+                    else if(w.MathJax.Hub) w.MathJax.Hub.Queue(["Typeset", w.MathJax.Hub, this.dom.content]);
                 }
-                // 2. Try MathJax v2 (Hub Queue)
-                else if (w.MathJax && w.MathJax.Hub) {
-                    w.MathJax.Hub.Queue(["Typeset", w.MathJax.Hub, container]);
-                }
-                // 3. Try Katex (Manual render)
-                else if (w.renderKatex) {
-                    // Find elements with tex classes if necessary or just run on container
-                    // Note: This is generic, OLM usually uses MathJax
-                }
-            }, 200);
+                // Hỗ trợ Katex nếu có
+                if (w.renderKatex) { /* logic katex */ }
+            }, 100);
         }
     }
 
-    // ============ INITIALIZE & INTERCEPT ============
-    const init = () => {
-        console.log('🚀 OLM Deep Space Viewer v4 initialized');
-        const viewer = new AnswerViewerUI();
+    // ==========================================
+    // 3. MAIN (KHỞI CHẠY)
+    // ==========================================
+    const Main = () => {
+        console.log('🚀 OLM Ultimate Viewer v5.1 (Fix) Started');
+        const app = new ViewerUI();
         const w = unsafeWindow || window;
 
-        // --- XHR Interception ---
-        const originalOpen = w.XMLHttpRequest.prototype.open;
-        const originalSend = w.XMLHttpRequest.prototype.send;
-
+        // --- XHR Hook ---
+        const origOpen = w.XMLHttpRequest.prototype.open;
         w.XMLHttpRequest.prototype.open = function(method, url) {
-            this._url = url;
-            return originalOpen.apply(this, arguments);
-        };
-
-        w.XMLHttpRequest.prototype.send = function() {
             this.addEventListener('load', function() {
-                const url = this._url || this.responseURL;
                 if (url && (url.includes('get-question') || url.includes('/question'))) {
                     try {
-                        const data = JSON.parse(this.responseText);
-                        if (Array.isArray(data)) viewer.addAnswers(data);
-                        else if (data.data && Array.isArray(data.data)) viewer.addAnswers(data.data);
-                        else if (data.questions && Array.isArray(data.questions)) viewer.addAnswers(data.questions);
-                        else if (data.result && Array.isArray(data.result)) viewer.addAnswers(data.result);
-                    } catch (e) {
-                        // ignore parsing errors
-                    }
+                        const json = JSON.parse(this.responseText);
+                        const list = Array.isArray(json) ? json : (json.data || json.questions || json.result);
+                        if (list) app.addData(list);
+                    } catch(e){}
                 }
             });
-            return originalSend.apply(this, arguments);
+            origOpen.apply(this, arguments);
         };
 
-        // --- Fetch Interception ---
-        const originalFetch = w.fetch;
-        w.fetch = async function(...args) {
-            const response = await originalFetch.apply(this, args);
+        // --- Fetch Hook ---
+        const origFetch = w.fetch;
+        w.fetch = async (...args) => {
+            const response = await origFetch(...args);
             const url = args[0] instanceof Request ? args[0].url : args[0];
 
             if (url && (url.includes('get-question') || url.includes('/question'))) {
-                const clone = response.clone();
-                clone.json().then(data => {
-                    if (Array.isArray(data)) viewer.addAnswers(data);
-                    else if (data.data && Array.isArray(data.data)) viewer.addAnswers(data.data);
-                    else if (data.questions && Array.isArray(data.questions)) viewer.addAnswers(data.questions);
-                    else if (data.result && Array.isArray(data.result)) viewer.addAnswers(data.result);
-                }).catch(() => {});
+                response.clone().json().then(json => {
+                    const list = Array.isArray(json) ? json : (json.data || json.questions || json.result);
+                    if (list) app.addData(list);
+                }).catch(()=>{});
             }
             return response;
         };
     };
 
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init);
-    } else {
-        init();
-    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', Main);
+    else Main();
+
 })();
